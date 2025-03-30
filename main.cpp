@@ -35,12 +35,14 @@
 #define IDC_ATTACK_LOG     1007
 #define IDC_ADAPTER_COMBO  1008
 #define IDC_IP_FILTER_EDIT 1009
+#define IDC_OPEN_BTN       1010
 
 // 全局变量
 HWND g_hWnd = NULL;
 HWND g_hStartBtn = NULL;
 HWND g_hStopBtn = NULL;
 HWND g_hSaveBtn = NULL;
+HWND g_hOpenBtn = NULL;
 HWND g_hFilterEdit = NULL;
 HWND g_hIPFilterEdit = NULL;
 HWND g_hPacketList = NULL;
@@ -137,6 +139,13 @@ void UpdatePacketList(const PacketInfo& info);
 void ShowPacketDetail(int index);
 bool DetectSQLInjection(const std::string& payload);
 void LogAttack(const char* message);
+void LogAttackW(const wchar_t* message);
+void CheckSQLInjection();
+void OpenPcapFile();
+
+// 新增函数声明
+std::string URLDecode(const std::string& encoded);
+std::vector<std::string> SplitMultipartData(const std::string& data, const std::string& boundary);
 
 // 主函数
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
@@ -219,22 +228,27 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             CreateControls(hWnd);
             break;
         case WM_COMMAND:
-            switch (LOWORD(wParam)) {
-                case IDC_START_BTN:
-                    StartCapture();
-                    EnableWindow(g_hStartBtn, FALSE);
-                    EnableWindow(g_hStopBtn, TRUE);
-                    break;
-                case IDC_STOP_BTN:
-                    StopCapture();
-                    EnableWindow(g_hStartBtn, TRUE);
-                    EnableWindow(g_hStopBtn, FALSE);
-                    break;
+        switch (LOWORD(wParam)) {
+            case IDC_START_BTN:
+                StartCapture();
+                EnableWindow(g_hStartBtn, FALSE);
+                EnableWindow(g_hStopBtn, TRUE);
+                break;
+            case IDC_STOP_BTN:
+                StopCapture();
+                EnableWindow(g_hStartBtn, TRUE);
+                EnableWindow(g_hStopBtn, FALSE);
+                break;
                 case IDC_SAVE_BTN:
                     // SQL注入检测按钮
+                    CheckSQLInjection();
                     break;
-            }
-            break;
+                case IDC_OPEN_BTN:
+                    // 打开PCAP文件按钮
+                    OpenPcapFile();
+                break;
+        }
+        break;
         case WM_NOTIFY:
             if (((LPNMHDR)lParam)->idFrom == IDC_PACKET_LIST && 
                 ((LPNMHDR)lParam)->code == NM_CLICK) {
@@ -243,9 +257,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             }
             break;
         case WM_APP:
-            EnableWindow(g_hSaveBtn, TRUE);
+            // 如果已经开始捕获，则启用SQL注入分析按钮，但不修改其当前状态
+            if (g_isCapturing) {
+                EnableWindow(g_hSaveBtn, TRUE);
+            }
             UpdatePacketList(*(PacketInfo*)lParam);
-            break;
+            break; 
         case WM_APP + 1:
             EnableWindow(g_hStartBtn, TRUE);
             EnableWindow(g_hStopBtn, FALSE);
@@ -260,7 +277,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 MoveWindow(g_hAdapterCombo, 10, 10, 300, 300, TRUE);  // 增加高度确保下拉框可见
                 MoveWindow(g_hStartBtn, 320, 10, 80, 25, TRUE);
                 MoveWindow(g_hStopBtn, 410, 10, 80, 25, TRUE);
-                MoveWindow(g_hSaveBtn, 500, 10, 80, 25, TRUE);
+                MoveWindow(g_hSaveBtn, 500, 10, 85, 25, TRUE);
+                MoveWindow(g_hOpenBtn, rc.right - 140, 10, 120, 25, TRUE);  // 放在右侧位置
                 
                 // 过滤器标签和输入框
                 MoveWindow(g_hFilterLabel, 10, 45, 100, 20, TRUE);
@@ -380,9 +398,9 @@ void CreateControls(HWND hWnd) {
     );
     
     g_hSaveBtn = CreateWindowW(
-        L"BUTTON", L"SQL注入检查",
+        L"BUTTON", L"分析SQL注入",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
-        500, 10, 80, 25,  // 恢复原来的位置
+        500, 10, 85, 25,  // 稍微增加宽度以适应新文本
         hWnd, (HMENU)IDC_SAVE_BTN, NULL, NULL
     );
     
@@ -444,6 +462,20 @@ void CreateControls(HWND hWnd) {
         10, rc.bottom - 60, rc.right - 20, 50,  // 调整日志位置
         hWnd, (HMENU)IDC_ATTACK_LOG, NULL, NULL
     );
+
+    // 创建打开文件按钮
+    g_hOpenBtn = CreateWindowW(
+        L"BUTTON", L"打开PCAP文件",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        800, 10, 120, 25,
+        hWnd, (HMENU)IDC_OPEN_BTN, NULL, NULL
+    );
+    
+    // 初始化按钮状态
+    EnableWindow(g_hStartBtn, TRUE);
+    EnableWindow(g_hStopBtn, FALSE);
+    EnableWindow(g_hSaveBtn, FALSE);
+    EnableWindow(g_hOpenBtn, TRUE);
 }
 
 void StartCapture() {
@@ -569,6 +601,8 @@ void StartCapture() {
     // 更新UI状态
     EnableWindow(g_hStartBtn, FALSE);
     EnableWindow(g_hStopBtn, TRUE);
+    EnableWindow(g_hSaveBtn, TRUE);  // 使SQL注入检查按钮在开始捕获后可用
+    EnableWindow(g_hOpenBtn, FALSE); // 捕获时禁用打开文件按钮
 
     // 显示开始抓包提示
     std::wstring status = L"开始抓包...\n选中网卡: " + 
@@ -623,6 +657,8 @@ void StopCapture() {
     // 直接更新UI状态（主线程中执行）
     EnableWindow(g_hStartBtn, TRUE);
     EnableWindow(g_hStopBtn, FALSE);
+    EnableWindow(g_hOpenBtn, TRUE);  // 确保打开文件按钮启用
+    // 保持g_hSaveBtn可用，不禁用SQL注入检查按钮
     
     // 询问用户是否保存数据包
     if (!g_packets.empty()) {
@@ -681,9 +717,9 @@ void ProcessPacket(const u_char* pkt_data, struct pcap_pkthdr* header) {
     // 解析TCP/UDP/ICMP等头部
     switch (ip_header->protocol) {
         case 6: { // TCP协议
-            TCP_HEADER* tcp_header = (TCP_HEADER*)(pkt_data + sizeof(ETHERNET_HEADER) + ip_header_len);
-            info.src_port = ntohs(tcp_header->src_port);
-            info.dst_port = ntohs(tcp_header->dst_port);
+        TCP_HEADER* tcp_header = (TCP_HEADER*)(pkt_data + sizeof(ETHERNET_HEADER) + ip_header_len);
+        info.src_port = ntohs(tcp_header->src_port);
+        info.dst_port = ntohs(tcp_header->dst_port);
             break;
         }
         case 17: { // UDP协议
@@ -699,8 +735,8 @@ void ProcessPacket(const u_char* pkt_data, struct pcap_pkthdr* header) {
             break;
         }
         default:
-            info.src_port = 0;
-            info.dst_port = 0;
+        info.src_port = 0;
+        info.dst_port = 0;
             break;
     }
     
@@ -776,10 +812,6 @@ void UpdatePacketList(const PacketInfo& info) {
         case 50: protocol_name = L"ESP"; break;
         case 51: protocol_name = L"AH"; break;
         case 89: protocol_name = L"OSPF"; break;
-        default: 
-            swprintf(buffer, L"%d", info.protocol);
-            protocol_name = buffer;
-            break;
     }
     lvi.pszText = const_cast<LPWSTR>(protocol_name);
     ListView_SetItem(g_hPacketList, &lvi);
@@ -1173,29 +1205,502 @@ void SavePackets() {
 }
 
 bool DetectSQLInjection(const std::string& payload) {
-    static const std::regex sql_pattern(
-        "('|%27)|(--|%2d%2d)|(;|%3b)|\\b(union|select|insert|update|delete|drop|alter)\\b",
-        std::regex::icase);
-    return std::regex_search(payload, sql_pattern);
+    // 基本的SQL注入检测模式
+    static const std::regex sql_patterns[] = {
+        // 单引号注入和注释攻击
+        std::regex("('|%27)[^\\w\\s]*(--|#|/\\*|;|%3B)", std::regex::icase),
+        
+        // 常见的SQL关键字攻击
+        std::regex("\\b(union\\s+select|insert\\s+into|update\\s+set|delete\\s+from|drop\\s+table|alter\\s+table|exec(\\s+|\\+)+(s|x)p\\w+)\\b", std::regex::icase),
+        
+        // 堆叠查询攻击
+        std::regex(";[\\s\\w]*?(select|insert|update|delete|drop|alter|exec)\\b", std::regex::icase),
+        
+        // 布尔盲注
+        std::regex("\\band\\s+\\d+=\\d+\\b|\\bor\\s+\\d+=\\d+\\b|\\band\\s+'[^']+'='[^']+'\\b|\\bor\\s+'[^']+'='[^']+'\\b", std::regex::icase),
+        
+        // 时间盲注
+        std::regex("\\b(sleep|waitfor\\s+delay|pg_sleep|benchmark)\\s*\\(", std::regex::icase),
+        
+        // 常见的绕过技术
+        std::regex("(%27|\\')\\s*or\\s*1\\s*=\\s*1|\\bunion\\s+[^\\w]*(all|distinct|select)\\b", std::regex::icase)
+    };
+
+    // 检查是否是HTTP请求
+    if (payload.find("GET ") == 0 || payload.find("POST ") == 0) {
+        // 查找请求头和请求体的分界
+        size_t header_end = payload.find("\r\n\r\n");
+        if (header_end == std::string::npos) {
+            return false;
+        }
+
+        // 提取请求行和请求头
+        std::string request_line = payload.substr(0, payload.find("\r\n"));
+        std::string headers = payload.substr(payload.find("\r\n") + 2, header_end - payload.find("\r\n") - 2);
+        std::string body = payload.substr(header_end + 4);
+
+        // 分析GET请求
+        if (request_line.find("GET ") == 0) {
+            // 提取URL和查询参数
+            size_t url_start = request_line.find(" ") + 1;
+            size_t url_end = request_line.find(" ", url_start);
+            if (url_end == std::string::npos) {
+                return false;
+            }
+            std::string url = request_line.substr(url_start, url_end - url_start);
+
+            // 提取查询参数
+            size_t query_start = url.find("?");
+            if (query_start != std::string::npos) {
+                std::string query = url.substr(query_start + 1);
+                // URL解码
+                std::string decoded_query = URLDecode(query);
+                
+                // 检查查询参数
+                for (const auto& pattern : sql_patterns) {
+                    if (std::regex_search(decoded_query, pattern)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        // 分析POST请求
+        else if (request_line.find("POST ") == 0) {
+            // 检查Content-Type
+            std::string content_type;
+            size_t ct_pos = headers.find("Content-Type: ");
+            if (ct_pos != std::string::npos) {
+                size_t ct_end = headers.find("\r\n", ct_pos);
+                content_type = headers.substr(ct_pos + 13, ct_end - ct_pos - 13);
+            }
+
+            // 处理不同Content-Type的POST数据
+            if (content_type == "application/x-www-form-urlencoded") {
+                // URL解码POST数据
+                std::string decoded_body = URLDecode(body);
+                for (const auto& pattern : sql_patterns) {
+                    if (std::regex_search(decoded_body, pattern)) {
+                        return true;
+                    }
+                }
+            }
+            else if (content_type == "application/json") {
+                // 处理JSON数据
+                try {
+                    // 这里可以添加JSON解析逻辑
+                    // 目前简单检查整个JSON字符串
+                    for (const auto& pattern : sql_patterns) {
+                        if (std::regex_search(body, pattern)) {
+                            return true;
+                        }
+                    }
+                }
+                catch (...) {
+                    // JSON解析失败，跳过
+                }
+            }
+            else if (content_type == "multipart/form-data") {
+                // 处理multipart数据
+                // 提取boundary
+                size_t boundary_pos = content_type.find("boundary=");
+                if (boundary_pos != std::string::npos) {
+                    std::string boundary = content_type.substr(boundary_pos + 9);
+                    // 解析multipart数据
+                    std::vector<std::string> parts = SplitMultipartData(body, boundary);
+                    for (const auto& part : parts) {
+                        for (const auto& pattern : sql_patterns) {
+                            if (std::regex_search(part, pattern)) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return false;
 }
 
-void LogAttack(const char* message) {
+// URL解码函数
+std::string URLDecode(const std::string& encoded) {
+    std::string decoded;
+    for (size_t i = 0; i < encoded.length(); ++i) {
+        if (encoded[i] == '%') {
+            if (i + 2 < encoded.length()) {
+                int value;
+                std::istringstream hex_chars(encoded.substr(i + 1, 2));
+                hex_chars >> std::hex >> value;
+                decoded += static_cast<char>(value);
+                i += 2;
+            }
+        }
+        else if (encoded[i] == '+') {
+            decoded += ' ';
+        }
+        else {
+            decoded += encoded[i];
+        }
+    }
+    return decoded;
+}
+
+// 分割multipart数据
+std::vector<std::string> SplitMultipartData(const std::string& data, const std::string& boundary) {
+    std::vector<std::string> parts;
+    std::string delimiter = "--" + boundary;
+    size_t pos = 0;
+    size_t prev = 0;
+
+    while ((pos = data.find(delimiter, prev)) != std::string::npos) {
+        if (pos > prev) {
+            parts.push_back(data.substr(prev, pos - prev));
+        }
+        prev = pos + delimiter.length();
+    }
+
+    if (prev < data.length()) {
+        parts.push_back(data.substr(prev));
+    }
+
+    return parts;
+}
+
+// 添加宽字符版本的日志函数
+void LogAttackW(const wchar_t* wMessage) {
     // 获取当前时间
     SYSTEMTIME st;
     GetSystemTime(&st);
     
     // 格式化日志消息
-    char timestamp[32];
-    sprintf(timestamp, "%04d-%02d-%02d %02d:%02d:%02d",
+    wchar_t wTimestamp[32];
+    swprintf(wTimestamp, L"%04d-%02d-%02d %02d:%02d:%02d",
             st.wYear, st.wMonth, st.wDay,
             st.wHour, st.wMinute, st.wSecond);
     
-    // 将日志消息添加到攻击日志列表框
-    char log_entry[512];
-    sprintf(log_entry, "[%s] %s", timestamp, message);
-    SendMessage(g_hAttackLog, LB_ADDSTRING, 0, (LPARAM)log_entry);
+    // 格式化Unicode日志消息
+    wchar_t wLogEntry[512];
+    swprintf(wLogEntry, L"[%s] %s\r\n", wTimestamp, wMessage);
+    
+    // 获取当前文本长度
+    int textLength = GetWindowTextLengthW(g_hAttackLog);
+    
+    // 将光标移到文本末尾
+    SendMessageW(g_hAttackLog, EM_SETSEL, (WPARAM)textLength, (LPARAM)textLength);
+    
+    // 插入新的日志消息
+    SendMessageW(g_hAttackLog, EM_REPLACESEL, FALSE, (LPARAM)wLogEntry);
     
     // 自动滚动到最新的日志
-    int count = SendMessage(g_hAttackLog, LB_GETCOUNT, 0, 0);
-    SendMessage(g_hAttackLog, LB_SETCURSEL, count - 1, 0);
+    SendMessageW(g_hAttackLog, EM_SCROLLCARET, 0, 0);
+}
+
+void LogAttack(const char* message) {
+    // 将ASCII/UTF-8消息转换为Unicode，尝试多种编码方式
+    wchar_t wMessage[512] = {0};
+    
+    // 尝试UTF-8编码转换
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, message, -1, wMessage, 512) == 0) {
+        // 如果UTF-8转换失败，尝试系统默认ANSI编码
+        MultiByteToWideChar(CP_ACP, 0, message, -1, wMessage, 512);
+    }
+    
+    // 调用宽字符版本
+    LogAttackW(wMessage);
+}
+
+// 将二进制数据转换为可打印的十六进制格式
+std::string BinaryToHexString(const unsigned char* data, size_t len) {
+    static const char hex_chars[] = "0123456789ABCDEF";
+    std::string result;
+    result.reserve(len * 3); // 每个字节需要两个十六进制字符和一个空格
+    
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char byte = data[i];
+        result.push_back(hex_chars[(byte >> 4) & 0x0F]);
+        result.push_back(hex_chars[byte & 0x0F]);
+        result.push_back(' ');
+    }
+    
+    return result;
+}
+
+// 安全地处理可能包含二进制数据的负载
+std::string SafePayloadToString(const std::string& payload) {
+    std::string result;
+    result.reserve(payload.size());
+    
+    for (size_t i = 0; i < payload.size(); ++i) {
+        char c = payload[i];
+        // 只保留可打印ASCII字符，替换其他字符
+        if (c >= 32 && c <= 126) {
+            result.push_back(c);
+        } else {
+            result.push_back('.');
+        }
+    }
+    
+    return result;
+}
+
+void CheckSQLInjection() {
+    if (g_packets.empty()) {
+        MessageBoxW(g_hWnd, L"没有捕获的数据包可供分析", L"SQL注入检查", MB_ICONINFORMATION);
+        return;
+    }
+    
+    // 禁用SQL注入检查按钮，防止重复点击
+    EnableWindow(g_hSaveBtn, FALSE);
+    
+    int totalPackets = 0;
+    int httpPackets = 0;
+    int suspiciousPackets = 0;
+    std::vector<std::string> suspiciousRequests;
+    
+    // 清空攻击日志
+    SetWindowTextW(g_hAttackLog, L"正在检查SQL注入攻击，请稍候...");
+    
+    // 显示进度信息
+    LogAttackW(L"开始SQL注入分析...");
+    
+    // 遍历所有捕获的数据包
+    {
+        std::lock_guard<std::mutex> lock(g_packetsMutex);
+        totalPackets = g_packets.size();
+        
+        int processedPackets = 0;
+        int lastProgressPercent = 0;
+        
+        for (const auto& packet : g_packets) {
+            // 显示进度
+            processedPackets++;
+            int progressPercent = (processedPackets * 100) / totalPackets;
+            if (progressPercent > lastProgressPercent && progressPercent % 10 == 0) {
+                wchar_t progress[64];
+                swprintf(progress, L"分析进度: %d%%", progressPercent);
+                LogAttackW(progress);
+                lastProgressPercent = progressPercent;
+                
+                // 处理Windows消息队列，保持UI响应
+                MSG msg;
+                while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+                    TranslateMessage(&msg);
+                    DispatchMessage(&msg);
+                }
+            }
+            
+            // 跳过太小的数据包
+            if (packet.size() < sizeof(ETHERNET_HEADER) + sizeof(IP_HEADER)) {
+                continue;
+            }
+            
+            // 解析以太网帧头
+            ETHERNET_HEADER* eth_header = (ETHERNET_HEADER*)packet.data();
+            
+            // 检查是否是IP数据包
+            if (ntohs(eth_header->type) != 0x0800) {
+                continue;
+            }
+            
+            // 解析IP头
+            IP_HEADER* ip_header = (IP_HEADER*)(packet.data() + sizeof(ETHERNET_HEADER));
+            int ip_header_len = (ip_header->ver_ihl & 0x0F) * 4;
+            
+            // 检查是否是TCP数据包
+            if (ip_header->protocol != 6) {
+                continue;
+            }
+            
+            // 解析TCP头
+            TCP_HEADER* tcp_header = (TCP_HEADER*)(packet.data() + sizeof(ETHERNET_HEADER) + ip_header_len);
+            int tcp_header_len = ((tcp_header->data_offset & 0xF0) >> 4) * 4;
+            
+            // 检查是否是HTTP请求（目标端口80或443）
+            if (ntohs(tcp_header->dst_port) != 80 && ntohs(tcp_header->dst_port) != 443) {
+                continue;
+            }
+            
+            httpPackets++;
+            
+            // 提取HTTP负载
+            int payload_offset = sizeof(ETHERNET_HEADER) + ip_header_len + tcp_header_len;
+            int payload_len = packet.size() - payload_offset;
+            
+            if (payload_len <= 0) {
+                continue;
+            }
+            
+            // 将负载转换为字符串进行分析
+            std::string payload(reinterpret_cast<const char*>(packet.data() + payload_offset), payload_len);
+            
+            // 检查是否包含SQL注入模式
+            if (DetectSQLInjection(payload)) {
+                suspiciousPackets++;
+                
+                // 提取IP和端口信息
+                char src_ip[16] = {0};
+                sprintf(src_ip, "%d.%d.%d.%d", 
+                        (ip_header->src_addr) & 0xFF,
+                        (ip_header->src_addr >> 8) & 0xFF,
+                        (ip_header->src_addr >> 16) & 0xFF,
+                        (ip_header->src_addr >> 24) & 0xFF);
+                
+                // 使用宽字符版本的日志函数
+                wchar_t wsrc_ip[16] = {0};
+                MultiByteToWideChar(CP_ACP, 0, src_ip, -1, wsrc_ip, 16);
+                
+                wchar_t wlog_message[512];
+                swprintf(wlog_message, L"检测到疑似SQL注入攻击: %s:%d -> %d [%zu bytes]", 
+                        wsrc_ip, ntohs(tcp_header->src_port), 
+                        ntohs(tcp_header->dst_port), payload.length());
+                
+                LogAttackW(wlog_message);
+                
+                // 保存请求的前100个字符以供参考，替换不可打印字符
+                std::string safePayload = SafePayloadToString(payload.substr(0, 100));
+                if (payload.length() > 100) {
+                    safePayload += "...";
+                }
+                suspiciousRequests.push_back(safePayload);
+            }
+        }
+    }
+    
+    LogAttack("SQL注入分析完成");
+    
+    // 显示结果
+    wchar_t result[1024];
+    swprintf(result, L"SQL注入检查完成:\n共分析 %d 个数据包\n其中 %d 个HTTP包\n检测到 %d 个疑似SQL注入攻击", 
+             totalPackets, httpPackets, suspiciousPackets);
+    
+    MessageBoxW(g_hWnd, result, L"SQL注入检查结果", MB_ICONINFORMATION);
+    
+    // 如果找到可疑请求，添加到日志
+    if (!suspiciousRequests.empty()) {
+        LogAttack("------ 可疑SQL注入请求摘要 ------");
+        for (size_t i = 0; i < suspiciousRequests.size(); i++) {
+            // 安全地添加索引和请求内容
+            std::string index_str = "[" + std::to_string(i + 1) + "] ";
+            LogAttack((index_str + suspiciousRequests[i]).c_str());
+        }
+        LogAttack("------ 检查结束 ------");
+    } else if (httpPackets > 0) {
+        LogAttack("未检测到SQL注入攻击");
+    } else {
+        LogAttack("未检测到HTTP请求");
+    }
+    
+    // 重新启用SQL注入检查按钮
+    EnableWindow(g_hSaveBtn, TRUE);
+}
+
+void OpenPcapFile() {
+    // 如果正在捕获，先停止
+    if (g_isCapturing) {
+        int result = MessageBoxW(g_hWnd, L"当前正在捕获数据包，是否停止捕获并打开文件？", 
+                               L"确认", MB_YESNO | MB_ICONQUESTION);
+        if (result == IDYES) {
+            StopCapture();
+        } else {
+            return;
+        }
+    }
+    
+    // 清空现有数据包
+    {
+        std::lock_guard<std::mutex> lock(g_packetsMutex);
+        g_packets.clear();
+    }
+    
+    // 清空列表视图
+    ListView_DeleteAllItems(g_hPacketList);
+    
+    // 清空树视图
+    TreeView_DeleteAllItems(g_hPacketDetail);
+    
+    // 创建打开文件对话框
+    wchar_t filename[MAX_PATH] = {0};
+    OPENFILENAMEW ofn = {0};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_hWnd;
+    ofn.lpstrFilter = L"PCAP文件 (*.pcap;*.pcapng)\0*.pcap;*.pcapng\0所有文件 (*.*)\0*.*\0";
+    ofn.lpstrFile = filename;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    
+    if (!GetOpenFileNameW(&ofn)) {
+        return; // 用户取消
+    }
+    
+    // 转换宽字符文件名为多字节字符串
+    char mbFilename[MAX_PATH] = {0};
+    WideCharToMultiByte(CP_ACP, 0, filename, -1, mbFilename, MAX_PATH, NULL, NULL);
+    
+    // 设置状态消息
+    SetWindowTextW(g_hAttackLog, L"正在加载文件，请稍候...");
+    
+    // 使用宽字符版本的日志函数
+    LogAttackW(L"开始加载PCAP文件...");
+    
+    // 打开PCAP文件
+    char errbuf[PCAP_ERRBUF_SIZE] = {0};
+    pcap_t* pcap = pcap_open_offline(mbFilename, errbuf);
+    
+    if (!pcap) {
+        std::string err_msg = "无法打开PCAP文件: " + std::string(errbuf);
+        LogAttack(err_msg.c_str());
+        MessageBoxW(g_hWnd, L"无法打开PCAP文件，请确认文件格式正确", L"错误", MB_ICONERROR);
+        return;
+    }
+    
+    // 读取并处理数据包
+    pcap_pkthdr* header;
+    const u_char* data;
+    int packet_count = 0;
+    int ret;
+    
+    while ((ret = pcap_next_ex(pcap, &header, &data)) == 1) {
+        // 处理数据包
+        ProcessPacket(data, header);
+        packet_count++;
+        
+        // 每处理100个数据包更新一次UI，保持响应性
+        if (packet_count % 100 == 0) {
+            wchar_t progress_msg[64];
+            swprintf(progress_msg, L"已加载 %d 个数据包...", packet_count);
+            LogAttackW(progress_msg);
+            
+            // 处理Windows消息队列，保持UI响应
+            MSG msg;
+            while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
+        }
+    }
+    
+    // 关闭PCAP文件
+    pcap_close(pcap);
+    
+    // 更新UI
+    wchar_t complete_msg[64];
+    swprintf(complete_msg, L"成功加载 %d 个数据包", packet_count);
+    LogAttackW(complete_msg);
+    
+    // 更新窗口标题显示当前打开的文件
+    std::wstring fileName = ofn.lpstrFile;
+    size_t lastSlash = fileName.find_last_of(L'\\');
+    if (lastSlash != std::wstring::npos) {
+        fileName = fileName.substr(lastSlash + 1);
+    }
+    
+    std::wstring windowTitle = L"网络流量分析工具 - " + fileName;
+    SetWindowTextW(g_hWnd, windowTitle.c_str());
+    
+    // 使按钮状态正确
+    EnableWindow(g_hStartBtn, TRUE);
+    EnableWindow(g_hStopBtn, FALSE);
+    EnableWindow(g_hSaveBtn, TRUE);  // 启用SQL注入分析按钮
+    
+    MessageBoxW(g_hWnd, L"文件加载完成！", L"成功", MB_ICONINFORMATION);
 }
